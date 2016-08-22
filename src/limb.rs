@@ -12,7 +12,6 @@
 // WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-
 use {rand, polyfill, c, core, error};
 
 // XXX: Not correct for x32 ABIs.
@@ -27,7 +26,7 @@ pub const LIMB_BYTES: usize = (LIMB_BITS + 7) / 8;
 /// `max_exclusive` is a slice of limbs ordered least-significant-limb to
 /// most-significant-limb (and the limbs use the native endianness).
 pub struct Range<'a> {
-    pub max_exclusive: &'a [Limb],
+    max_exclusive: &'a [Limb],
 }
 
 impl <'a>Range<'a> {
@@ -59,7 +58,8 @@ impl <'a>Range<'a> {
     }
 
     // Loosely based on NSA Guide Appendix B.2:
-    // "Key Pair Generation by Testing Candidates".
+    // "Key Pair Generation by Testing Candidates",
+    // with modifications adapted from OpenSSL.
     //
     // TODO: DRY-up with `ec::suite_b::private_key::generate_private_key`?
     //
@@ -72,7 +72,11 @@ impl <'a>Range<'a> {
 
         assert_eq!(self.max_exclusive.len(), dest.len());
 
-        let bits_to_mask = self.leading_zero_bits();
+        // TODO(DJ) Move into constructor
+        // TODO(DJ) Clean up and comment logic which skips this special case
+        // if there are no leading zeros
+        let starts_with_0b100 = starts_with_0b100(self.max_exclusive) && self.leading_zero_bits() > 0;
+        let bits_to_mask = if starts_with_0b100 { self.leading_zero_bits() - 1 } else { self.leading_zero_bits() };
 
         // XXX: The value 100 was chosen to match OpenSSL due to uncertainty of
         // what specific value would be better, but it seems bad to try 100 times.
@@ -89,6 +93,59 @@ impl <'a>Range<'a> {
 
             if self.are_limbs_within(&dest) {
                 return Ok(());
+            }
+
+            if starts_with_0b100 {
+                // `x` is of the form `0b100...`. This means:
+                //
+                //    x < 2**n - 2**(n-2) - 2**(n-3).
+                //
+                // This means that `3*x < 2**(n+1)`. Proof:
+                //
+                //  3*x < 3*(2**n - 2**(n-2) - 2**(n-3))
+                //      < (2 + 1)*(2**n - 2**(n-2) - 2**(n-3))
+                //      < 2*(2**n - 2**(n-2) - 2**(n-3)) + 2**n - 2**(n-2) - 2**(n-3)
+                //      < 2**(n+1) - 2**(n-1) - 2**(n-2) + 2**n - 2**(n-2) - 2**(n-3)
+                //      < 2**(n+1) + 2**n - 2**(n-1) - 2**(n-2) - 2**(n-2) - 2**(n-3)
+                //      < 2**(n+1) + 2**n - 2**(n-1) - 2*(2**(n-2)) - 2**(n-3)
+                //      < 2**(n+1) + 2**n - 2**(n-1) - 2**(n-1) - 2**(n-3)
+                //      < 2**(n+1) + 2**n - 2*(2**(n-1)) - 2**(n-3)
+                //      < 2**(n+1) + 2**n - 2**n - 2**(n-3)
+                //      < 2**(n+1) - 2**(n-3)
+                //
+                // Then clearly 2**(n+1) - 2**(n-3) < 2**(n+1) since n is positive.
+                //
+                // This means we can generate a value in the range [0, 2**(n+1)),
+                // which would fall into one of four sub-intervals:
+                //
+                //    [0, max)          => Return the value as-is.
+                //    [max, 2*max)      => Return `value - max`.
+                //    [2*max, 3*max)    => Return `value - max - max`.
+                //    [3*max, 2**(n+1)) => Generate a new random value and try again.
+                //
+                // This avoids biasing the result towards small values, which is
+                // what reducing the random value (mod max) would do, while
+                // reducing the probability that a new random value will be needed.
+                //
+                // Further, at this point, we know `dest` isn't in the range [0, max),
+                // so either it's zero or it's >= `max_exclusive`. Because
+                // `limbs_reduce_once_constant_time` compares before subtracting,
+                // what follows is safe in either case, although it's pointless
+                // in the (highly improbable) zero case.
+
+                limbs_reduce_once_constant_time(dest, self.max_exclusive);
+                if self.are_limbs_within(&dest) {
+                    // [max, 2*max)
+                    return Ok(());
+                }
+
+                limbs_reduce_once_constant_time(dest, self.max_exclusive);
+                if self.are_limbs_within(&dest) {
+                    // [2*max, 3*max)
+                    return Ok(());
+                }
+
+                // [3*max, 2**(n+1)) or zero
             }
         }
 
@@ -132,6 +189,37 @@ fn limbs_as_bytes_mut<'a>(src: &'a mut [Limb]) -> &'a mut [u8] {
     polyfill::slice::u32_as_u8_mut(src)
 }
 
+fn starts_with_0b100(limbs: &[Limb]) -> bool {
+    debug_assert!(limbs.len() > 0);
+
+    let most_sig_limb = limbs[limbs.len() - 1];
+    let next_limb = if limbs.len() > 1 {
+        Some(limbs[limbs.len() - 2])
+    } else {
+        None
+    };
+
+    debug_assert!(most_sig_limb > 0);
+
+    match most_sig_limb {
+        4 => true,
+        3 => false,
+        2 => match next_limb {
+            None => false,
+            Some(l) => { l < (1 << (LIMB_BITS - 1)) },
+        },
+        1 => match next_limb {
+            None => false,
+            Some(l) => { l < (1 << (LIMB_BITS - 2)) },
+        },
+        _ => {
+            let used_bits = LIMB_BITS - (most_sig_limb.leading_zeros() as usize);
+            let most_sig_bit = 1 << (used_bits - 1);
+            most_sig_limb - most_sig_bit < most_sig_bit >> 2
+        },
+    }
+}
+
 #[allow(unsafe_code)]
 pub fn limbs_less_than_limbs_constant_time(a: &[Limb], b: &[Limb]) -> bool {
     assert_eq!(a.len(), b.len());
@@ -149,17 +237,30 @@ pub fn limbs_are_zero_constant_time(limbs: &[Limb]) -> bool {
     result != 0
 }
 
+/// Equivalent to `if (r >= m) { r -= m; }`
+#[allow(unsafe_code)]
+pub fn limbs_reduce_once_constant_time(r: &mut [Limb], m: &[Limb]) {
+    assert_eq!(r.len(), m.len());
+    unsafe {
+        GFp_constant_time_limbs_reduce_once(r.as_mut_ptr(), m.as_ptr(), m.len());
+    }
+}
+
 extern {
     fn GFp_constant_time_limbs_are_zero(a: *const Limb, num_limbs: c::size_t)
                                         -> Limb;
 
     fn GFp_constant_time_limbs_lt_limbs(a: *const Limb, b: *const Limb,
                                         num_limbs: c::size_t) -> Limb;
+
+    fn GFp_constant_time_limbs_reduce_once(r: *mut Limb, m: *const Limb,
+                                           num_limbs: c::size_t);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::starts_with_0b100;
     use rand;
 
     #[cfg(target_pointer_width = "64")] const MAX_LIMB: Limb = 0xffffffffffffffff;
@@ -220,4 +321,51 @@ mod tests {
         assert!(dest.iter().any( |b| *b > 0 ));
     }
 
+    #[test]
+    fn test_starts_with_0b100() {
+        assert!(!starts_with_0b100(&[1]));
+        assert!(!starts_with_0b100(&[2]));
+        assert!(!starts_with_0b100(&[3]));
+        assert!(starts_with_0b100(&[4]));
+        assert!(!starts_with_0b100(&[5]));
+        assert!(!starts_with_0b100(&[6]));
+        assert!(!starts_with_0b100(&[7]));
+        assert!(starts_with_0b100(&[8]));
+        assert!(starts_with_0b100(&[9]));
+        assert!(!starts_with_0b100(&[10]));
+
+        assert!(starts_with_0b100(&[0, 1]));
+        assert!(starts_with_0b100(&[Limb::max_value() >> 2, 1]));
+        assert!(!starts_with_0b100(&[Limb::max_value() >> 1, 1]));
+        assert!(starts_with_0b100(&[Limb::max_value() >> 1, 2]));
+        assert!(!starts_with_0b100(&[Limb::max_value(), 2]));
+        assert!(!starts_with_0b100(&[Limb::max_value() >> 1, 3]));
+        assert!(starts_with_0b100(&[Limb::max_value(), 4]));
+        assert!(!starts_with_0b100(&[0, 5]));
+        assert!(!starts_with_0b100(&[0, 6]));
+        assert!(!starts_with_0b100(&[0, 7]));
+        assert!(starts_with_0b100(&[0, 8]));
+        assert!(starts_with_0b100(&[0, 9]));
+        assert!(!starts_with_0b100(&[0, 10]));
+    }
+
+}
+
+#[cfg(feature = "internal_benches")]
+mod bench {
+    use super::*;
+    use bench;
+    use rand;
+
+    #[bench]
+    fn bench_sample_into_limbs(b: &mut bench::Bencher) {
+        let limbs = &[0, 0, 0, 0, 0, 0, 0, 16];
+        let mut dest: [Limb; 8] = [0; 8];
+        let rng = rand::SystemRandom::new();
+
+        b.iter(|| {
+            let range = Range::from_max_exclusive(limbs);
+            range.sample_into_limbs(&mut dest, &rng)
+        });
+    }
 }

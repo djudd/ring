@@ -14,7 +14,7 @@
 
 #![allow(unsafe_code)]
 
-use {c, der, error};
+use {der, error};
 use core;
 use untrusted;
 
@@ -252,13 +252,12 @@ impl CommonOps {
     // Gueron for the details. This is the case for both the field order and
     // group order for both P-256 and P-384, but it is not the case for all
     // curves. For example, it is not true for P-521.
+    //
+    // TODO(DJ): This interface is misleading: `a` is actually mutated.
     fn reduced_limbs(&self, a: &[Limb; MAX_LIMBS], p: &[Limb; MAX_LIMBS])
                      -> [Limb; MAX_LIMBS] {
         let mut r = *a;
-        unsafe {
-            GFp_constant_time_limbs_reduce_once(r.as_mut_ptr(), p.as_ptr(),
-                                                self.num_limbs);
-        }
+        limbs_reduce_once_constant_time(&mut r, p);
         r
     }
 }
@@ -551,12 +550,6 @@ pub fn limbs_less_than_limbs(a: &[Limb], b: &[Limb]) -> bool {
         }
     }
     false
-}
-
-
-extern {
-    fn GFp_constant_time_limbs_reduce_once(r: *mut Limb, m: *const Limb,
-                                           num_limbs: c::size_t);
 }
 
 
